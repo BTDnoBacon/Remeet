@@ -1,7 +1,7 @@
 from __future__ import print_function
 import tempfile
 import speech_recognition as sr
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request,session
 from pydub import AudioSegment
 import requests
 import boto3
@@ -13,6 +13,9 @@ from werkzeug.utils import secure_filename
 import ffmpeg
 import json
 from flask_cors import CORS
+from flask_session import Session
+from flask import make_response
+from transformers import GPT2Tokenizer
 
 app = Flask(__name__)
 # .env 파일에서 환경 변수를 로드합니다.
@@ -27,6 +30,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REGION_NAME = "ap-northeast-2"
 BUCKET_NAME = "remeet"
 ALLOWED_EXTENSIONS = { "txt", "pdf", "png", "jpg", "jpeg","gif","mp4", "wav", "mp3", "mp4", "avi","mov","flv","wmv",}
+
+app.secret_key = 'bkplusbk'
+app.config["SESSION_PERMANENT"] = True
+
+app.config["SESSION_TYPE"] = "filesystem"
+Session(app)
+
+# 토큰 수 계산하기
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
 # S3 클라이언트 설정
 s3_client = boto3.client(
@@ -178,48 +190,58 @@ def videoMaker(text, voice_id, avatar_id):
     return result["data"]["video_url"]
 
 
-# GPT 관련
-# GPT 관련
+# 대화 수정
+def change_conversation(history):
+    new_history = []
+    # 최근대화만 가져올 수 있도록
+    if len(history) >= 10:
+        history = history[len(history)-5:]
+    for message in history:
+        for key,value in message.items():
+            if key == "나 ":
+                role = 'user'
+            else:
+                role = 'assistant'
+            new_history.append({'role':role, 'content': value})
+    return new_history
 
 
-def gpt_answer(model_name, conversation_text, input_text):
+
+# GPT 관련
+
+def gpt_answer(model_name, conversation_text, conversation_history, input_text):
     global OPENAI_API_KEY
     first_setting = """
-    너는 {0} 인척 나랑 대화를 해야해. {0}은 죽었어.
-    평소 {0}와 나의 대화가 있어.
+    You are {0}, {0} is dead. 그러나 {0}이 살아있을 때의 그들의 말투와 표현 방식을 정확하게 모방하여 대화를 이어나가야 한다.
     """.format(
         model_name
     )
 
     last_setting = """
-    여기까지가 평소 나와 {0}의 대화야, 무조건 반말로,
-    이 대화에서 {0}의 말투를 따라해서, 내 말에 {0}처럼 한개의 문장만 대답해줘
+    이전에 {0}과 나눈 대화에서 {0}의 말투와 어휘를 분석해. 하지만 주의할 점은, 이전 대화의 내용을 그대로 반복하는 것이 아니라, 그 말투와 스타일을 유지하면서 새로운 상황에 맞는 독창적인 대답을 생성해야 한다. 이전 대화의 말투와 어휘를 사용해 현재 질문에 맞는 새로운 내용으로 응답해야 한다.
+    이러한 예시를 참고하여, 반말로, 너는 이제부터 나의 질문인 에 {0}으로서 대화에 한문장으로 응답해야 한다.
+    내 질문은 이거야.
+
     """.format(
         model_name
     )
-
+    messages = [{"role": "system", "content": first_setting + conversation_text + last_setting + input_text}]
+    for message in conversation_history:
+        messages.append(message)
+    # messages = session_conversation.copy()
     response = requests.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
         json={
             "model": "gpt-3.5-turbo",
-            "messages": [
-                # system = 사용자가 입력하는 인물, 성격, 특징
-                {
-                    "role": "system",
-                    "content": first_setting + conversation_text + last_setting,
-                },
-                {"role": "user", "content": input_text},
-            ],
+            "messages": messages
         },
     )
     chat_response = (
         response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
     )
-
-    if f"{model_name}:" in chat_response:
+    if f"{model_name}:" in chat_response or f"{model_name} :" in chat_response or f"나:" in chat_response or f"나 :" in chat_response: 
         chat_response = chat_response.split(":")[-1]
-
     return chat_response
 
 
@@ -496,11 +518,14 @@ def make_common_video():
 # video 기반 대화 생성 API
 @app.route("/api/v1/conversation/video", methods=["POST"])
 def make_conversation_video():
+
     input_text = request.json.get("question")
     model_name = request.json.get("modelName")
     conversation_text = request.json.get("conversationText")
     app.logger.info("GPT API ATTEMPT")
-    answer = gpt_answer(model_name, conversation_text, input_text)
+    model_no = request.json.get("modelNo")
+    conversation_history = request.json.get("history")
+    answer, messages = gpt_answer(model_name, conversation_text, conversation_history, input_text)
     voice = request.json.get("heyVoiceId")
     # 대화상대의 Heygen Talking Photo ID
     avatar = request.json.get("avatarId")
@@ -517,15 +542,32 @@ def make_conversation_voice():
         model_name = request.json.get("modelName")
         conversation_text = request.json.get("conversationText")
         app.logger.info("GPT API ATTEMPT")
-        answer = gpt_answer(model_name, conversation_text, input_text)
+        # answer = gpt_answer(model_name, conversation_text, input_text)
         ele_voice_id = request.json.get("eleVoiceId")
         user_no = request.json.get("userNo")
         model_no = request.json.get("modelNo")
+        conversation_history = request.json.get("history")
         conversation_no = request.json.get("conversationNo")
         app.logger.info("TTS API ATTEMPT")
+        tokens = tokenizer.encode(conversation_text)
+        # print(tokens)
+        print('질문dd',input_text)
+        print('대화이력dd',conversation_history)
+        # voice_url = make_tts(ele_voice_id, answer, user_no, model_no, conversation_no)
+
+        # print(modified_history,'수정된것')
+
+        # print(modified_history)
+        answer = gpt_answer(model_name, conversation_text, change_conversation(conversation_history), input_text)
+        print('대답dd',answer)
+        app.logger.info("TTS API ATTEMPT")
+        # TTS 함수 호출하여 음성 URL 가져오기
         voice_url = make_tts(ele_voice_id, answer, user_no, model_no, conversation_no)
+
         # 성공 응답을 JSON으로 포맷 후 반환
-        return jsonify({"answer": answer, "URL": voice_url})
+        response = jsonify({"answer": answer, "URL": voice_url})
+
+        return response
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -580,4 +622,4 @@ def signup_image():
 # 회원가입 image 저장 API : 502번째줄부터 시작
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=True)
