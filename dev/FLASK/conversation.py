@@ -1,7 +1,7 @@
 from __future__ import print_function
 import tempfile
 import speech_recognition as sr
-from flask import Flask, jsonify, request,session
+from flask import Flask, jsonify, request
 from pydub import AudioSegment
 import requests
 import boto3
@@ -13,39 +13,30 @@ from werkzeug.utils import secure_filename
 import ffmpeg
 import json
 from flask_cors import CORS
-from flask_session import Session
-from flask import make_response
-from transformers import GPT2Tokenizer
+import logging
 
 app = Flask(__name__)
 # .env 파일에서 환경 변수를 로드합니다.
 CORS(app)
+app.logger.setLevel(logging.INFO)
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-x_api_key = os.getenv("x-api-key")
+x_api_key = os.getenv("x_api_key")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 REGION_NAME = "ap-northeast-2"
 BUCKET_NAME = "remeet"
-ALLOWED_EXTENSIONS = { "txt", "pdf", "png", "jpg", "jpeg","gif","mp4", "wav", "mp3", "mp4", "avi","mov","flv","wmv",}
-
-app.secret_key = 'bkplusbk'
-app.config["SESSION_PERMANENT"] = True
-
-app.config["SESSION_TYPE"] = "filesystem"
-Session(app)
-
-# 토큰 수 계산하기
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+ALLOWED_EXTENSIONS = {"txt", "pdf", "png", "jpg", "jpeg", "gif", "mp4", "wav", "mp3", "mp4", "avi", "mov", "flv",
+                      "wmv", }
 
 # S3 클라이언트 설정
 s3_client = boto3.client(
     "s3",
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    region_name=REGION_NAME,)
+    region_name=REGION_NAME, )
 
 
 def allowed_file(filename):
@@ -79,6 +70,8 @@ def get_wav_info(wav_filename):
 
 
 def commonvideoMaker(avatar_id):
+    app.logger.info("HEYGEN_COMMON_VIDEO API ATTEMPT")
+
     global x_api_key
 
     # talking photo ID를 선택해 기본 영상(Silent Video) 생성
@@ -105,6 +98,8 @@ def commonvideoMaker(avatar_id):
     }
 
     response_silent = requests.post(url_silent, json=payload_silent, headers=headers)
+    app.logger.info("HEYGEN_COMMON_VIDEO API Response result : ", response_silent.status_code)
+
     tmp = json.loads(response_silent.text)
     video_id = tmp["data"]["video_id"]
     video_url = f"https://api.heygen.com/v1/video_status.get?video_id={video_id}"
@@ -121,8 +116,11 @@ def commonvideoMaker(avatar_id):
     return result["data"]["video_url"]
 
 
-def getVoiceId(voice_name):
+@app.route("/api/v1/heyVoiceId", methods=['POST'])
+def getVoiceId():
+    app.logger.info("HEYGEN_VIDEO_ID API ATTEMPT")
     global x_api_key
+    voice_name = request.json.get("type")
     hey_headers = {"accept": "application/json", "x-api-key": x_api_key}
     # talking photo ID 전체조회
     # url_avatar = "https://api.heygen.com/v1/talking_photo.list"
@@ -131,6 +129,7 @@ def getVoiceId(voice_name):
     url_voice = "https://api.heygen.com/v1/voice.list"
     voice_list = requests.get(url_voice, headers=hey_headers)
     voice_json = json.loads(voice_list.text)
+    app.logger.info("HEYGEN_VIDEO_ID API Response result : ", voice_list.status_code)
 
     # voice name으로 voice ID 조회
     voice_id = "none"
@@ -140,18 +139,19 @@ def getVoiceId(voice_name):
             voice_id = voice["voice_id"]
             break
 
-    return jsonify({"voice_id": voice_id})
+    return jsonify({"result": voice_id})
 
 
-def videoMaker(text, voice_id, avatar_id):
+def videoMaker(text, voice_id, avatar_id, admin):
+    app.logger.info("HEYGEN_VIDEO_MAKER API ATTEMPT")
     global x_api_key
-
+    test = False if admin else True
     # voice ID 와 talking photo ID를 선택해 input text로 영상 생성
     url_avatar = "https://api.heygen.com/v1/video.generate"
     payload_avatar = {
         "background": "#ffffff",
         "ratio": "16:9",
-        "test": False,
+        "test": test,
         "version": "v1alpha",
         "clips": [
             {
@@ -172,6 +172,8 @@ def videoMaker(text, voice_id, avatar_id):
     }
 
     response_avatar = requests.post(url_avatar, json=payload_avatar, headers=headers)
+    app.logger.info("HEYGEN_VIDEO_MAKER API Response result : ", response_avatar.status_code)
+
     # print(response_avatar.text)
     # print(response_avatar.text["data"]["video_id"])
     tmp = json.loads(response_avatar.text)
@@ -194,22 +196,25 @@ def videoMaker(text, voice_id, avatar_id):
 def change_conversation(history):
     new_history = []
     # 최근대화만 가져올 수 있도록
-    if len(history) >= 10:
-        history = history[len(history)-5:]
-    for message in history:
-        for key,value in message.items():
-            if key == "나 ":
-                role = 'user'
-            else:
-                role = 'assistant'
-            new_history.append({'role':role, 'content': value})
+    # if len(history) >= 10:
+    #     history = history[len(history)-5:]
+    if history != None:
+        for message in history:
+            for key, value in message.items():
+                if key == "나 ":
+                    role = 'user'
+                else:
+                    role = 'assistant'
+                new_history.append({'role': role, 'content': value})
     return new_history
 
 
-
+# GPT 관련
 # GPT 관련
 
+
 def gpt_answer(model_name, conversation_text, conversation_history, input_text):
+    app.logger.info("GPT API ATTEMPT")
     global OPENAI_API_KEY
     first_setting = """
     You are {0}, {0} is dead. 그러나 {0}이 살아있을 때의 그들의 말투와 표현 방식을 정확하게 모방하여 대화를 이어나가야 한다.
@@ -221,26 +226,30 @@ def gpt_answer(model_name, conversation_text, conversation_history, input_text):
     이전에 {0}과 나눈 대화에서 {0}의 말투와 어휘를 분석해. 하지만 주의할 점은, 이전 대화의 내용을 그대로 반복하는 것이 아니라, 그 말투와 스타일을 유지하면서 새로운 상황에 맞는 독창적인 대답을 생성해야 한다. 이전 대화의 말투와 어휘를 사용해 현재 질문에 맞는 새로운 내용으로 응답해야 한다.
     이러한 예시를 참고하여, 반말로, 너는 이제부터 나의 질문인 에 {0}으로서 대화에 한문장으로 응답해야 한다.
     내 질문은 이거야.
-
     """.format(
         model_name
     )
     messages = [{"role": "system", "content": first_setting + conversation_text + last_setting + input_text}]
-    for message in conversation_history:
-        messages.append(message)
+    # if conversation_history != None:
+    #     for message in conversation_history:
+    #         messages.append(message)
     # messages = session_conversation.copy()
+    print(messages)
     response = requests.post(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        # headers={"Authorization": f"Bearer sk - ELgOyzBfpaWRyZMT1xFCT3BlbkFJvvS9nvOiUAIXm4hNNk8k"},
         json={
             "model": "gpt-3.5-turbo",
             "messages": messages
         },
     )
+    print(response)
+    app.logger.info("GPT API Response result : ", response.status_code)
     chat_response = (
         response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
     )
-    if f"{model_name}:" in chat_response or f"{model_name} :" in chat_response or f"나:" in chat_response or f"나 :" in chat_response: 
+    if f"{model_name}:" in chat_response or f"{model_name} :" in chat_response or f"나:" in chat_response or f"나 :" in chat_response:
         chat_response = chat_response.split(":")[-1]
     return chat_response
 
@@ -250,6 +259,7 @@ def gpt_answer(model_name, conversation_text, conversation_history, input_text):
 
 
 def make_voice(model_name, gender, audio_files):
+    app.logger.info("MAKE_VOICE API ATTEMPT")
     make_voice_url = "https://api.elevenlabs.io/v1/voices/add"
 
     headers = {"Accept": "application/json", "xi-api-key": ELEVENLABS_API_KEY}
@@ -264,7 +274,7 @@ def make_voice(model_name, gender, audio_files):
         make_voice_url, headers=headers, data=data, files=audio_files
     )
     response.raise_for_status()
-
+    app.logger.info("MAKE_VOICE API Response result : ", response.status_code)
     json_response = response.json()
 
     if "voice_id" not in json_response:
@@ -274,6 +284,7 @@ def make_voice(model_name, gender, audio_files):
 
 
 def make_tts(ele_voice_id, text, user_no, model_no, conversation_no):
+    app.logger.info("TTS API ATTEMPT")
     stability, similarity_boost = 0.5, 0.75
     # voice_id = request.json.get('voiceId')
     # text = request.json.get('answer')
@@ -295,6 +306,7 @@ def make_tts(ele_voice_id, text, user_no, model_no, conversation_no):
     }
 
     response = requests.post(tts_url, json=data, headers=headers, stream=True)
+    app.logger.info("TTS API Response result : ", response.status_code)
 
     # API 응답 상태 확인
     if response.status_code != 200:
@@ -341,16 +353,18 @@ def make_tts(ele_voice_id, text, user_no, model_no, conversation_no):
         return file_url
     except Exception as e:
         print(str(e))
+        app.logger.info("TTS API Response result : ", 500, "- Failed to upload file")
         return jsonify({"error": "Failed to upload file"}), 500
 
 
 # 파일 업로드 API
-
+# 파일 업로드 API
 
 @app.route("/api/v1/upload/files", methods=["POST"])
 def upload_files():
     app.logger.info("UPLOAD_FILES API ATTEMPT")
     if "files" not in request.files:
+        app.logger.info("UPLOAD_FILES API Response result : ", 400, "- No file part")
         return jsonify(error="No file part"), 400
 
     files = request.files.getlist("files")
@@ -379,7 +393,7 @@ def upload_files():
                         target_path, vcodec="libx264", acodec="aac"
                     ).run(overwrite_output=True)
 
-            if fileType == "audio":
+            if fileType == "voice":
                 new_path = f'{file.filename.split(".")[0]}' + ".mp3"
                 convert_audio_to_mp3(temp_blob_path, new_path)
             elif fileType == "video":
@@ -395,6 +409,7 @@ def upload_files():
                 s3_url = f"https://remeet.s3.ap-northeast-2.amazonaws.com/{folder_key + new_path}"
                 responses.append(s3_url)
             except Exception as e:
+                app.logger.info("UPLOAD_FILES API Response result : ", str(e))
                 responses.append("Failed to upload file")
 
             # 각 파일 처리에 대한 응답을 저장
@@ -404,16 +419,18 @@ def upload_files():
 
 
 # STT API
-
+# STT API
 
 @app.route("/api/v1/transcribe", methods=["POST"])
 def transcribe_audio():
     app.logger.info("STT API ATTEMPT")
     if "file" not in request.files:
+        app.logger.info("STT API Response result : ", 400, "- No file part")
         return jsonify({"error": "No file part"}), 400
 
     file = request.files["file"]
     if file.filename == "":
+        app.logger.info("STT API Response result : ", 400, "- No selected file")
         return jsonify({"error": "No selected file"}), 400
 
     if file:
@@ -437,31 +454,24 @@ def transcribe_audio():
                 audio_data = r.record(source)
                 try:
                     text = r.recognize_google(audio_data, language="ko-KR")
-                    return jsonify({"transcription": text}), 200
+                    return jsonify({"result": text}), 200
                 except sr.UnknownValueError:
-                    return (
-                        jsonify(
-                            {
-                                "error": "Speech Recognition could not understand the audio"
-                            }
-                        ),
-                        422,
-                    )
+                    app.logger.info("STT API Response result : ", 422,
+                                    "- Speech Recognition could not understand the audio")
+                    return jsonify({"error": "Speech Recognition could not understand the audio"}), 422
                 except sr.RequestError as e:
-                    return (
-                        jsonify(
-                            {
-                                "error": f"Could not request results from the Speech Recognition service; {e}"
-                            }
-                        ),
-                        503,
-                    )
+                    app.logger.info("STT API Response result : ", 503,
+                                    f"- Could not request results from the Speech Recognition service; {e}")
+                    return jsonify(
+                        {"error": f"Could not request results from the Speech Recognition service; {e}"}), 503
+
             # 임시 파일은 이 블록을 벗어나면 자동으로 삭제됩니다.
+    app.logger.info("STT API Response result : ", 400, "- Invalid file")
     return jsonify({"error": "Invalid file"}), 400
 
 
 # VOICE MODEL 생성 API
-
+# VOICE MODEL 생성 API
 
 @app.route("/api/v1/conversation/makevoice", methods=["POST"])
 def make_voice_model():
@@ -479,32 +489,52 @@ def make_voice_model():
         return jsonify({"voice_id": voice_id})
     except Exception as e:
         print(str(e))
+        app.logger.info("MAKE_VOICE API Response result : ", 500, "-", str(e))
         return jsonify({"error": str(e)}), 500
 
 
 # AVATAR 생성 API
-
+# AVATAR 생성 API
 
 @app.route("/api/v1/createAvatarID", methods=["POST"])
 def upload_avatar():
+    app.logger.info("CREATE_AVATAR_ID API ATTEMPT")
     # Avatar로 사용할 사진 업로드
-    x_api_key = os.getenv("x-api-key")
+    x_api_key = os.getenv("x_api_key")
     if "file" not in request.files:
+        app.logger.info("CREATE_AVATAR_ID API Response result : ", 400, "- No file part")
         return jsonify(error="No file part"), 400
     file = request.files["file"]
     if file.filename == "":
+        app.logger.info("CREATE_AVATAR_ID API Response result : ", 400, "- No selected file")
         return jsonify(error="No selected file"), 400
     # files = {'file': (file.filename, file, 'image/jpeg')}
+    temp_blob_path = secure_filename(file.filename)  # 안전한 파일 이름 사용
+    file.save(temp_blob_path)
 
-    resp = requests.post(
-        "https://upload.heygen.com/v1/talking_photo",
-        data=file.read(),  # 파일의 내용을 읽어서 줘야함
-        headers={"Content-Type": "image/jpeg", "x-api-key": x_api_key},
-    )
-    result = resp.json()["data"]["talking_photo_id"]
-    return result
+    def convert_image_to_jpeg(source_path, target_path):
+        if source_path == target_path:
+            target_path = "tmp_" + os.path.basename(target_path)
+        ffmpeg.input(source_path).output(
+            target_path, format='image2', vcodec='mjpeg'
+        ).run(overwrite_output=True)
+
+    if allowed_file(file):
+        new_path = file.filename
+    else:
+        new_path = f'{file.filename.split(".")[0]}.jpeg'
+        convert_image_to_jpeg(temp_blob_path, new_path)
+    with open(new_path, "rb") as file:
+        resp = requests.post(
+            "https://upload.heygen.com/v1/talking_photo",
+            data=file,  # 파일의 내용을 읽어서 줘야함
+            headers={"Content-Type": "image/jpeg", "x-api-key": x_api_key},
+        )
+    app.logger.info("CREATE_AVATAR_ID API Response result : ", resp.status_code)
+    return jsonify({"result": resp.json()["data"]["talking_photo_id"]}), 200
 
 
+# 기본 영상 생성 API
 # 기본 영상 생성 API
 @app.route("/api/v1/conversation/commonvideo", methods=["POST"])
 def make_common_video():
@@ -516,69 +546,71 @@ def make_common_video():
 
 
 # video 기반 대화 생성 API
+# video 기반 대화 생성 API
 @app.route("/api/v1/conversation/video", methods=["POST"])
 def make_conversation_video():
-
+    app.logger.info("CONVERSATION_VIDEO API ATTEMPT")
     input_text = request.json.get("question")
     model_name = request.json.get("modelName")
     conversation_text = request.json.get("conversationText")
-    app.logger.info("GPT API ATTEMPT")
-    model_no = request.json.get("modelNo")
     conversation_history = request.json.get("history")
-    answer, messages = gpt_answer(model_name, conversation_text, conversation_history, input_text)
+    print(conversation_history, '이게 수정전')
+    if conversation_history == None:
+        pass
+    else:
+        tmp = change_conversation(conversation_history)
+        conversation_history = tmp
+    answer = gpt_answer(model_name, conversation_text, conversation_history, input_text)
+
     voice = request.json.get("heyVoiceId")
-    # 대화상대의 Heygen Talking Photo ID
     avatar = request.json.get("avatarId")
-    app.logger.info("HEYGEN API ATTEMPT")
-    videoPath = videoMaker(answer, voice, avatar)
-    return jsonify({"answer": answer, "URL": videoPath})
+    is_admin = request.json.get("admin")
+    videoPath = videoMaker(answer, voice, avatar, is_admin)
+    return jsonify({"answer": answer, "url": videoPath})
 
 
+# voice 기반 대화 생성 API
 # voice 기반 대화 생성 API
 @app.route("/api/v1/conversation/voice", methods=["POST"])
 def make_conversation_voice():
     try:
+        app.logger.info("CONVERSATION_VIDEO API ATTEMPT")
         input_text = request.json.get("question")
         model_name = request.json.get("modelName")
         conversation_text = request.json.get("conversationText")
-        app.logger.info("GPT API ATTEMPT")
-        # answer = gpt_answer(model_name, conversation_text, input_text)
+        conversation_history = request.json.get("history")
+        print(conversation_history, '이게 수정전')
+        if conversation_history == None:
+            pass
+        else:
+            tmp = change_conversation(conversation_history)
+            conversation_history = tmp
+        print(conversation_history, '이게 수정후')
+        print(model_name, conversation_text, conversation_history, input_text)
+        answer = gpt_answer(model_name, conversation_text, conversation_history, input_text)
+        print(answer)
         ele_voice_id = request.json.get("eleVoiceId")
         user_no = request.json.get("userNo")
         model_no = request.json.get("modelNo")
-        conversation_history = request.json.get("history")
         conversation_no = request.json.get("conversationNo")
-        app.logger.info("TTS API ATTEMPT")
-        tokens = tokenizer.encode(conversation_text)
-        # print(tokens)
-        print('질문dd',input_text)
-        print('대화이력dd',conversation_history)
-        # voice_url = make_tts(ele_voice_id, answer, user_no, model_no, conversation_no)
-
-        # print(modified_history,'수정된것')
-
-        # print(modified_history)
-        answer = gpt_answer(model_name, conversation_text, change_conversation(conversation_history), input_text)
-        print('대답dd',answer)
-        app.logger.info("TTS API ATTEMPT")
-        # TTS 함수 호출하여 음성 URL 가져오기
         voice_url = make_tts(ele_voice_id, answer, user_no, model_no, conversation_no)
-
-        # 성공 응답을 JSON으로 포맷 후 반환
-        response = jsonify({"answer": answer, "URL": voice_url})
-
-        return response
+        return jsonify({"answer": answer, "url": voice_url})
 
     except Exception as e:
+        app.logger.info("CONVERSATION_VIDEO API Response result : ", 500, "-", str(e))
         return jsonify({"error": str(e)}), 500
 
 
 # 회원가입 image 저장 API
+# 회원가입 image 저장 API
 @app.route("/api/v1/signup", methods=["POST"])
 def signup_image():
     app.logger.info("SIGNUP_IMAGE API ATTEMPT")
+    key = AWS_ACCESS_KEY_ID[:6]
+    app.logger.info(key)
     if "file" not in request.files:
-        return "No file part"
+        app.logger.info("SIGNUP_IMAGE API Response result : ", 403, "- No file part")
+        return jsonify({"error": "No file part"}), 403
 
     file = request.files.get("file")
 
@@ -592,7 +624,7 @@ def signup_image():
         existing_indices = [int(key.split('/')[-1].split('.')[0]) for key in existing_file_keys if
                             key.split('/')[-1].split('.')[0].isdigit()]
         next_index = 1 if not existing_indices else max(existing_indices) + 1
-        new_path = str(next_index)+'.' +type
+        new_path = str(next_index) + '.' + type
         file.save(new_path)
         try:
             # 저장된 pcm 파일을 S3에 업로드
@@ -600,26 +632,27 @@ def signup_image():
                 s3_client.upload_fileobj(file, BUCKET_NAME, folder_key + new_path)
             os.remove(new_path)  # 임시 파일 삭제
             s3_url = f"https://remeet.s3.ap-northeast-2.amazonaws.com/{folder_key + new_path}"
-            return s3_url
+            return jsonify({'result': s3_url}), 200
         except Exception as e:
-            app.logger.exception("An error occurred")
-            return "error"
+            app.logger.info("SIGNUP_IMAGE API Response result : ", 405, "-", str(e))
+            return jsonify({'error': e}), 405
         # 각 파일 처리에 대한 응답을 저장
     else:
-        return "nofile"
+        app.logger.info("SIGNUP_IMAGE API Response result : ", 403, "- No file part")
+        return jsonify({"error": "No file part"}), 403
 
 
 # HEYGEN API 관련 : 65번째줄부터 시작
-# GPT API 관련 : 193번째줄부터 시작
-# ELEVENLABS API 관련 : 232번째줄부터 시작
-# FILE UPLOAD API : 320번쨰줄부터 시작
-# STT API : 376번쨰줄부터 시작
-# VOICE MODEL 생성 API :415번쨰줄부터 시작
-# AVATAR 생성 API : 433번째줄부터 시작
-# 기본 영상 생성 API : 454번째줄부터 시작
-# video 기반 대화 생성 API : 463번째줄부터 시작
-# voice 기반 대화 생성 API : 481번째줄부터 시작
-# 회원가입 image 저장 API : 502번째줄부터 시작
+# GPT API 관련 : 191번째줄부터 시작
+# ELEVENLABS API 관련 : 239번째줄부터 시작
+# FILE UPLOAD API : 342번쨰줄부터 시작
+# STT API : 402번쨰줄부터 시작
+# VOICE MODEL 생성 API :451번쨰줄부터 시작
+# AVATAR 생성 API : 474번째줄부터 시작
+# 기본 영상 생성 API : 513번째줄부터 시작
+# video 기반 대화 생성 API : 524번째줄부터 시작
+# voice 기반 대화 생성 API : 539번째줄부터 시작
+# 회원가입 image 저장 API : 561번째줄부터 시작
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
